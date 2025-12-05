@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using FirebaseAdmin;
 using FirebaseAdmin.Messaging;
 using Google.Apis.Auth.OAuth2;
+using Microsoft.AspNetCore.Builder.Extensions;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 
@@ -23,11 +24,17 @@ namespace Queueless.Services
             if (_initialized)
                 return;
 
-            // Path to firebase-admin-key.json
-            // appsettings.json:
-            // "Firebase": { "AdminSdkPath": "Secure/firebase-admin-key.json" }
-            var keyPath = configuration["Firebase:AdminSdkPath"];
+            // 1) First try env / config value "FcmKeyPath"
+            //    (for Render: /etc/secrets/firebase-admin-key.json)
+            var keyPath = configuration["FcmKeyPath"];
 
+            // 2) Fallback to your old setting "Firebase:AdminSdkPath"
+            if (string.IsNullOrWhiteSpace(keyPath))
+            {
+                keyPath = configuration["Firebase:AdminSdkPath"];
+            }
+
+            // 3) If still empty, use default Secure/firebase-admin-key.json
             if (string.IsNullOrWhiteSpace(keyPath))
             {
                 keyPath = Path.Combine(
@@ -35,22 +42,41 @@ namespace Queueless.Services
                     "Secure",
                     "firebase-admin-key.json");
             }
+            else
+            {
+                // If it's a relative path, make it relative to app base directory
+                if (!Path.IsPathRooted(keyPath))
+                {
+                    keyPath = Path.Combine(AppContext.BaseDirectory, keyPath);
+                }
+            }
 
             if (!File.Exists(keyPath))
             {
+                _logger.LogError("Firebase admin key file not found at {Path}", keyPath);
                 throw new FileNotFoundException(
-                    $"Firebase admin key file not found: {keyPath}");
+                    $"Firebase admin key file not found: {keyPath}", keyPath);
             }
+
+            _logger.LogInformation("Initializing FirebaseApp with key at {Path}", keyPath);
 
             var options = new AppOptions
             {
                 Credential = GoogleCredential.FromFile(keyPath)
             };
 
-            FirebaseApp.Create(options);
-            _initialized = true;
+            // Avoid creating multiple instances
+            if (FirebaseApp.DefaultInstance == null)
+            {
+                FirebaseApp.Create(options);
+                _logger.LogInformation("FirebaseApp initialized for FCM.");
+            }
+            else
+            {
+                _logger.LogInformation("FirebaseApp already initialized, reusing existing instance.");
+            }
 
-            _logger.LogInformation("FirebaseApp initialized for FCM.");
+            _initialized = true;
         }
 
         /// <summary>
@@ -62,7 +88,6 @@ namespace Queueless.Services
             string body,
             IReadOnlyDictionary<string, string>? data = null)
         {
-            // Make sure we pass the right type to Message.Data
             IReadOnlyDictionary<string, string> payload =
                 data ?? new Dictionary<string, string>();
 

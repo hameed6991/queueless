@@ -61,7 +61,7 @@ SELECT  t.TokenId,
         u.FcmToken
 FROM ServiceQueueToken t
 JOIN BusinessRegistration b ON b.BusinessId = t.BusinessId
-JOIN CustomerUser u         ON u.CustomerUserId = t.CustomerUserId
+JOIN AppUser u         ON u.UserId = t.CustomerUserId
 WHERE t.Status = 'Waiting'
   AND t.EstimatedWaitMinutes <= 5
   AND ISNULL(t.Alert5MinSent, 0) = 0

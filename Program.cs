@@ -4,10 +4,9 @@ using Queueless.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Expose on port 7007
-var port = Environment.GetEnvironmentVariable("PORT") ?? "7007"; // 7007 for local dev
+// Expose on port 7007 (Render will override PORT to its own value)
+var port = Environment.GetEnvironmentVariable("PORT") ?? "7007";
 builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
-
 
 // --------------------------------------
 // 1. Register services
@@ -30,7 +29,6 @@ builder.Services.AddScoped<ICustomerQueueService, CustomerQueueService>();
 builder.Services.AddSingleton<FcmService>();
 builder.Services.AddHostedService<QueueAlertWorker>();
 
-
 // --------------------------------------
 // 2. Build the app
 // --------------------------------------
@@ -39,13 +37,18 @@ var app = builder.Build();
 // --------------------------------------
 // 3. Configure HTTP pipeline
 // --------------------------------------
-if (app.Environment.IsDevelopment())
-{
-    app.UseSwagger();
-    app.UseSwaggerUI();
-}
 
-app.UseHttpsRedirection();
+// ✅ Always enable Swagger (Development + Production)
+app.UseSwagger();
+app.UseSwaggerUI(c =>
+{
+    c.SwaggerEndpoint("/swagger/v1/swagger.json", "Queueless API v1");
+    // Optional: uncomment this to show Swagger directly at "/"
+    // c.RoutePrefix = string.Empty;
+});
+
+// Optional: if HTTPS redirection gives trouble on Render, you can comment this out.
+// app.UseHttpsRedirection();
 
 app.UseAuthorization();
 

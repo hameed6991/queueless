@@ -1,10 +1,12 @@
 ﻿using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.SqlClient;
 using Queueless.Models.Auth;
+using Queueless.Models.Dtos;
 using System.Data;
 
 namespace Queueless.Controllers
 {
+
     [ApiController]
     [Route("api/auth")]
     public class AuthController : ControllerBase
@@ -15,7 +17,37 @@ namespace Queueless.Controllers
         {
             _connectionString = config.GetConnectionString("DefaultConnection");
         }
+        [HttpPost("complete-profile")]
+        public IActionResult CompleteProfile([FromBody] CompleteProfileDto dto)
+        {
+            if (dto == null || dto.UserId <= 0 || string.IsNullOrWhiteSpace(dto.FullName))
+            {
+                return BadRequest(new
+                {
+                    success = false,
+                    message = "Invalid profile data."
+                });
+            }
 
+            // TODO: hook this into your real DB tables.
+            // For now we just pretend it is saved successfully.
+
+            // Example of where you'd normally update DB:
+            // var user = await _db.AppUsers.FindAsync(dto.UserId);
+            // if (user == null) { return NotFound(...); }
+            // user.FullName = dto.FullName;
+            // user.Email = dto.Email;
+            // user.IsBusinessOwner = dto.IsBusinessOwner;
+            // await _db.SaveChangesAsync();
+
+            return Ok(new
+            {
+                success = true,
+                message = "Profile saved successfully.",
+                userId = dto.UserId,
+                isBusinessOwner = dto.IsBusinessOwner
+            });
+        }
         // ============================================================
         //  POST /api/auth/request-otp
         //  Inserts OTP row into UserOtp for reference (optional)

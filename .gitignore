@@ -1,0 +1,6 @@
+# build output (we never commit these)
+bin/
+obj/
+
+# secrets (do NOT push to GitHub)
+Secure/

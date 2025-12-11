@@ -18,6 +18,34 @@ namespace Queueless.Controllers
         }
 
         // ============================================================
+        //  POST /api/auth/complete-profile
+        //  Currently just validates + returns success (no DB write yet)
+        // ============================================================
+        [HttpPost("complete-profile")]
+        public IActionResult CompleteProfile([FromBody] CompleteProfileDto dto)
+        {
+            if (dto == null || dto.UserId <= 0 || string.IsNullOrWhiteSpace(dto.FullName))
+            {
+                return BadRequest(new
+                {
+                    success = false,
+                    message = "Invalid profile data."
+                });
+            }
+
+            // TODO: plug into your real DB if needed
+            // e.g. update AppUser / Business tables
+
+            return Ok(new
+            {
+                success = true,
+                message = "Profile saved successfully.",
+                userId = dto.UserId,
+                isBusinessOwner = dto.IsBusinessOwner
+            });
+        }
+
+        // ============================================================
         //  POST /api/auth/request-otp
         // ============================================================
         [HttpPost("request-otp")]
@@ -129,6 +157,7 @@ namespace Queueless.Controllers
                     {
                         reader.Close();
 
+                        // 4) Not found -> create new user row
                         using var cmdInsert = new SqlCommand(@"
                     INSERT INTO AppUser (MobileNumber, Role, IsActive, CreatedAtUtc)
                     VALUES (@MobileNumber, @Role, 1, SYSUTCDATETIME());

@@ -6,7 +6,6 @@ using System.Data;
 
 namespace Queueless.Controllers
 {
-
     [ApiController]
     [Route("api/auth")]
     public class AuthController : ControllerBase
@@ -17,40 +16,60 @@ namespace Queueless.Controllers
         {
             _connectionString = config.GetConnectionString("DefaultConnection");
         }
-        [HttpPost("complete-profile")]
-        public IActionResult CompleteProfile([FromBody] CompleteProfileDto dto)
-        {
-            if (dto == null || dto.UserId <= 0 || string.IsNullOrWhiteSpace(dto.FullName))
-            {
-                return BadRequest(new
-                {
-                    success = false,
-                    message = "Invalid profile data."
-                });
-            }
 
-            // TODO: hook this into your real DB tables.
-            // For now we just pretend it is saved successfully.
-
-            // Example of where you'd normally update DB:
-            // var user = await _db.AppUsers.FindAsync(dto.UserId);
-            // if (user == null) { return NotFound(...); }
-            // user.FullName = dto.FullName;
-            // user.Email = dto.Email;
-            // user.IsBusinessOwner = dto.IsBusinessOwner;
-            // await _db.SaveChangesAsync();
-
-            return Ok(new
-            {
-                success = true,
-                message = "Profile saved successfully.",
-                userId = dto.UserId,
-                isBusinessOwner = dto.IsBusinessOwner
-            });
-        }
         // ============================================================
         //  POST /api/auth/request-otp
-        //  Inserts OTP row into UserOtp for reference (optional)
+        // ============================================================
+        [HttpPost("request-otp")]
+        public async Task<ActionResult<RequestOtpResponse>> RequestOtp([FromBody] RequestOtpDto dto)
+        {
+            var response = new RequestOtpResponse();
+
+            if (dto == null || string.IsNullOrWhiteSpace(dto.MobileNumber))
+            {
+                response.Success = false;
+                response.Message = "MobileNumber is required.";
+                return BadRequest(response);
+            }
+
+            try
+            {
+                // Fixed OTP for now – same as what you type in app
+                var otp = "1234";
+                var nowUtc = DateTime.UtcNow;
+                var expiresAtUtc = nowUtc.AddMinutes(5);
+
+                using var con = new SqlConnection(_connectionString);
+                await con.OpenAsync();
+
+                using (var cmd = new SqlCommand(@"
+                    INSERT INTO UserOtp (MobileNumber, OtpCode, ExpiresAtUtc, IsUsed)
+                    VALUES (@MobileNumber, @OtpCode, @ExpiresAtUtc, 0);", con))
+                {
+                    cmd.Parameters.AddWithValue("@MobileNumber", dto.MobileNumber);
+                    cmd.Parameters.AddWithValue("@OtpCode", otp);
+                    cmd.Parameters.AddWithValue("@ExpiresAtUtc", expiresAtUtc);
+                    await cmd.ExecuteNonQueryAsync();
+                }
+
+                response.Success = true;
+                response.Message = "OTP sent.";
+                response.IsNewUser = false;    // we decide at verify
+                response.DebugOtp = otp;       // for testing only
+
+                return Ok(response);
+            }
+            catch (Exception ex)
+            {
+                response.Success = false;
+                response.Message = "Error while sending OTP.";
+                response.DebugOtp = ex.Message;
+                return StatusCode(500, response);
+            }
+        }
+
+        // ============================================================
+        //  POST /api/auth/verify-otp
         // ============================================================
         [HttpPost("verify-otp")]
         public async Task<ActionResult<VerifyOtpResponseDto>> VerifyOtp([FromBody] VerifyOtpRequestDto dto)
@@ -108,10 +127,8 @@ namespace Queueless.Controllers
                     }
                     else
                     {
-                        // close reader before new command
                         reader.Close();
 
-                        // 4) Not found -> create new user row with role based on login type
                         using var cmdInsert = new SqlCommand(@"
                     INSERT INTO AppUser (MobileNumber, Role, IsActive, CreatedAtUtc)
                     VALUES (@MobileNumber, @Role, 1, SYSUTCDATETIME());
@@ -174,13 +191,5 @@ namespace Queueless.Controllers
                 return StatusCode(500, response);
             }
         }
-
-
-        // ============================================================
-        //  POST /api/auth/verify-otp
-        //  Simple: check OTP == "1234", then create/find AppUser
-        // ============================================================
-
-
     }
 }

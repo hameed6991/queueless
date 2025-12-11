@@ -121,7 +121,7 @@ namespace Queueless.Controllers
 
             try
             {
-                // 1) OTP check (for now: fixed "1234")
+                // 1) OTP check (still fixed "1234" for now)
                 if (dto.Otp != "1234")
                 {
                     response.Success = false;
@@ -129,36 +129,50 @@ namespace Queueless.Controllers
                     return Ok(response);
                 }
 
+                // 2) Normalise login type (Customer / Business)
+                var loginType = (dto.LoginType ?? "Customer").Trim();
+                loginType = loginType.Equals("Business", StringComparison.OrdinalIgnoreCase)
+                    ? "Business"
+                    : "Customer";
+
                 using var con = new SqlConnection(_connectionString);
                 await con.OpenAsync();
 
                 long userId;
                 bool isNewUser;
+                string currentRole = null;
 
-                // 2) Try to find existing user by mobile
+                // 3) Try to find existing user by mobile
                 using (var cmdFind = new SqlCommand(
-                    "SELECT TOP 1 UserId FROM AppUser WHERE MobileNumber = @MobileNumber",
+                    "SELECT TOP 1 UserId, Role FROM AppUser WHERE MobileNumber = @MobileNumber",
                     con))
                 {
                     cmdFind.Parameters.AddWithValue("@MobileNumber", dto.MobileNumber);
 
-                    var result = await cmdFind.ExecuteScalarAsync();
-                    if (result != null && result != DBNull.Value)
+                    using var reader = await cmdFind.ExecuteReaderAsync();
+                    if (await reader.ReadAsync())
                     {
-                        userId = Convert.ToInt64(result);
+                        userId = reader.GetInt64(0);
+                        currentRole = reader.IsDBNull(1) ? null : reader.GetString(1);
                         isNewUser = false;
                     }
                     else
                     {
-                        // 3) Not found -> create new user row
+                        // 4) Not found -> create new user row
+                        isNewUser = true;
+                        currentRole = loginType; // default role for new user
+
+                        reader.Close(); // close before new command
+
                         using var cmdInsert = new SqlCommand(@"
-                            INSERT INTO AppUser (MobileNumber, Role, IsActive, CreatedAtUtc)
-                            VALUES (@MobileNumber, 'Customer', 1, SYSUTCDATETIME());
-                            SELECT CAST(SCOPE_IDENTITY() AS BIGINT);", con);
+                    INSERT INTO AppUser (MobileNumber, Role, IsActive, CreatedAtUtc)
+                    VALUES (@MobileNumber, @Role, 1, SYSUTCDATETIME());
+                    SELECT CAST(SCOPE_IDENTITY() AS BIGINT);", con);
 
                         cmdInsert.Parameters.AddWithValue("@MobileNumber", dto.MobileNumber);
-                        var newIdObj = await cmdInsert.ExecuteScalarAsync();
+                        cmdInsert.Parameters.AddWithValue("@Role", currentRole);
 
+                        var newIdObj = await cmdInsert.ExecuteScalarAsync();
                         if (newIdObj == null || newIdObj == DBNull.Value)
                         {
                             response.Success = false;
@@ -167,26 +181,50 @@ namespace Queueless.Controllers
                         }
 
                         userId = Convert.ToInt64(newIdObj);
-                        isNewUser = true;
                     }
                 }
 
-                // 4) Update last login
-                using (var cmdUpdate = new SqlCommand(
+                // 5) Merge roles if this user can be BOTH
+                //    - If existing role != requested loginType -> set to "Both"
+                string mergedRole = currentRole;
+                if (!isNewUser)
+                {
+                    if (string.IsNullOrEmpty(currentRole))
+                    {
+                        mergedRole = loginType;
+                    }
+                    else if (!currentRole.Equals(loginType, StringComparison.OrdinalIgnoreCase))
+                    {
+                        mergedRole = "Both";
+                    }
+
+                    if (!string.Equals(mergedRole, currentRole, StringComparison.OrdinalIgnoreCase))
+                    {
+                        using var cmdUpdateRole = new SqlCommand(
+                            "UPDATE AppUser SET Role = @Role WHERE UserId = @UserId",
+                            con);
+                        cmdUpdateRole.Parameters.AddWithValue("@Role", mergedRole);
+                        cmdUpdateRole.Parameters.AddWithValue("@UserId", userId);
+                        await cmdUpdateRole.ExecuteNonQueryAsync();
+                    }
+                }
+
+                // 6) Update last login
+                using (var cmdUpdateLogin = new SqlCommand(
                     "UPDATE AppUser SET LastLoginUtc = SYSUTCDATETIME() WHERE UserId = @UserId",
                     con))
                 {
-                    cmdUpdate.Parameters.AddWithValue("@UserId", userId);
-                    await cmdUpdate.ExecuteNonQueryAsync();
+                    cmdUpdateLogin.Parameters.AddWithValue("@UserId", userId);
+                    await cmdUpdateLogin.ExecuteNonQueryAsync();
                 }
 
-                // 5) Check if user has any active business
+                // 7) Check if this user owns any ACTIVE business
                 bool hasBusiness;
                 using (var cmdBiz = new SqlCommand(@"
-                    IF EXISTS (SELECT 1 FROM Business WHERE OwnerUserId = @UserId AND IsActive = 1)
-                        SELECT 1
-                    ELSE
-                        SELECT 0;", con))
+            IF EXISTS (SELECT 1 FROM Business WHERE OwnerUserId = @UserId AND IsActive = 1)
+                SELECT 1
+            ELSE
+                SELECT 0;", con))
                 {
                     cmdBiz.Parameters.AddWithValue("@UserId", userId);
                     var bizResult = await cmdBiz.ExecuteScalarAsync();
@@ -194,11 +232,14 @@ namespace Queueless.Controllers
                                    Convert.ToInt32(bizResult) == 1);
                 }
 
+                // 8) Build response
                 response.Success = true;
                 response.Message = "OTP verified.";
                 response.UserId = userId;
                 response.IsNewUser = isNewUser;
                 response.HasBusiness = hasBusiness;
+                response.Role = mergedRole;
+                response.ShowRoleSelection = hasBusiness; // frontend: if true, offer Customer/Business choice
 
                 return Ok(response);
             }
@@ -209,5 +250,6 @@ namespace Queueless.Controllers
                 return StatusCode(500, response);
             }
         }
+
     }
 }

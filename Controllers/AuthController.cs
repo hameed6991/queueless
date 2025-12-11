@@ -52,63 +52,10 @@ namespace Queueless.Controllers
         //  POST /api/auth/request-otp
         //  Inserts OTP row into UserOtp for reference (optional)
         // ============================================================
-        [HttpPost("request-otp")]
-        public async Task<ActionResult<RequestOtpResponse>> RequestOtp([FromBody] RequestOtpDto dto)
-        {
-            var response = new RequestOtpResponse();
-
-            if (dto == null || string.IsNullOrWhiteSpace(dto.MobileNumber))
-            {
-                response.Success = false;
-                response.Message = "MobileNumber is required.";
-                return BadRequest(response);
-            }
-
-            try
-            {
-                // Fixed OTP for now – same as what you type in app
-                var otp = "1234";
-                var nowUtc = DateTime.UtcNow;
-                var expiresAtUtc = nowUtc.AddMinutes(5);
-
-                using var con = new SqlConnection(_connectionString);
-                await con.OpenAsync();
-
-                // Optional: store OTP in UserOtp table if you want
-                using (var cmd = new SqlCommand(@"
-                    INSERT INTO UserOtp (MobileNumber, OtpCode, ExpiresAtUtc, IsUsed)
-                    VALUES (@MobileNumber, @OtpCode, @ExpiresAtUtc, 0);", con))
-                {
-                    cmd.Parameters.AddWithValue("@MobileNumber", dto.MobileNumber);
-                    cmd.Parameters.AddWithValue("@OtpCode", otp);
-                    cmd.Parameters.AddWithValue("@ExpiresAtUtc", expiresAtUtc);
-                    await cmd.ExecuteNonQueryAsync();
-                }
-
-                response.Success = true;
-                response.Message = "OTP sent.";
-                response.IsNewUser = false; // we will decide in verify step
-                response.DebugOtp = otp;     // only for testing
-
-                return Ok(response);
-            }
-            catch (Exception ex)
-            {
-                response.Success = false;
-                response.Message = "Error while sending OTP.";
-                response.DebugOtp = ex.Message; // so you can see DB error in Postman if needed
-                return StatusCode(500, response);
-            }
-        }
-
-        // ============================================================
-        //  POST /api/auth/verify-otp
-        //  Simple: check OTP == "1234", then create/find AppUser
-        // ============================================================
         [HttpPost("verify-otp")]
-        public async Task<ActionResult<VerifyOtpResponse>> VerifyOtp([FromBody] VerifyOtpDto dto)
+        public async Task<ActionResult<VerifyOtpResponseDto>> VerifyOtp([FromBody] VerifyOtpRequestDto dto)
         {
-            var response = new VerifyOtpResponse();
+            var response = new VerifyOtpResponseDto();
 
             if (dto == null ||
                 string.IsNullOrWhiteSpace(dto.MobileNumber) ||
@@ -121,7 +68,7 @@ namespace Queueless.Controllers
 
             try
             {
-                // 1) OTP check (still fixed "1234" for now)
+                // 1) OTP check (for now: fixed "1234")
                 if (dto.Otp != "1234")
                 {
                     response.Success = false;
@@ -129,9 +76,12 @@ namespace Queueless.Controllers
                     return Ok(response);
                 }
 
-                // 2) Normalise login type (Customer / Business)
-                var loginType = (dto.LoginType ?? "Customer").Trim();
-                loginType = loginType.Equals("Business", StringComparison.OrdinalIgnoreCase)
+                // 2) Normalise login type ("Customer" / "Business")
+                var cleanLoginType = string.IsNullOrWhiteSpace(dto.LoginType)
+                    ? "Customer"
+                    : dto.LoginType!.Trim();
+
+                var roleForNewUser = cleanLoginType.Equals("Business", StringComparison.OrdinalIgnoreCase)
                     ? "Business"
                     : "Customer";
 
@@ -140,12 +90,12 @@ namespace Queueless.Controllers
 
                 long userId;
                 bool isNewUser;
-                string currentRole = null;
+                string currentRole = "Customer";
 
                 // 3) Try to find existing user by mobile
                 using (var cmdFind = new SqlCommand(
-                    "SELECT TOP 1 UserId, Role FROM AppUser WHERE MobileNumber = @MobileNumber",
-                    con))
+                           "SELECT TOP 1 UserId, Role FROM AppUser WHERE MobileNumber = @MobileNumber",
+                           con))
                 {
                     cmdFind.Parameters.AddWithValue("@MobileNumber", dto.MobileNumber);
 
@@ -153,24 +103,22 @@ namespace Queueless.Controllers
                     if (await reader.ReadAsync())
                     {
                         userId = reader.GetInt64(0);
-                        currentRole = reader.IsDBNull(1) ? null : reader.GetString(1);
+                        currentRole = reader.IsDBNull(1) ? "Customer" : reader.GetString(1);
                         isNewUser = false;
                     }
                     else
                     {
-                        // 4) Not found -> create new user row
-                        isNewUser = true;
-                        currentRole = loginType; // default role for new user
+                        // close reader before new command
+                        reader.Close();
 
-                        reader.Close(); // close before new command
-
+                        // 4) Not found -> create new user row with role based on login type
                         using var cmdInsert = new SqlCommand(@"
                     INSERT INTO AppUser (MobileNumber, Role, IsActive, CreatedAtUtc)
                     VALUES (@MobileNumber, @Role, 1, SYSUTCDATETIME());
                     SELECT CAST(SCOPE_IDENTITY() AS BIGINT);", con);
 
                         cmdInsert.Parameters.AddWithValue("@MobileNumber", dto.MobileNumber);
-                        cmdInsert.Parameters.AddWithValue("@Role", currentRole);
+                        cmdInsert.Parameters.AddWithValue("@Role", roleForNewUser);
 
                         var newIdObj = await cmdInsert.ExecuteScalarAsync();
                         if (newIdObj == null || newIdObj == DBNull.Value)
@@ -181,44 +129,21 @@ namespace Queueless.Controllers
                         }
 
                         userId = Convert.ToInt64(newIdObj);
+                        isNewUser = true;
+                        currentRole = roleForNewUser;
                     }
                 }
 
-                // 5) Merge roles if this user can be BOTH
-                //    - If existing role != requested loginType -> set to "Both"
-                string mergedRole = currentRole;
-                if (!isNewUser)
+                // 5) Update last login
+                using (var cmdUpdate = new SqlCommand(
+                           "UPDATE AppUser SET LastLoginUtc = SYSUTCDATETIME() WHERE UserId = @UserId",
+                           con))
                 {
-                    if (string.IsNullOrEmpty(currentRole))
-                    {
-                        mergedRole = loginType;
-                    }
-                    else if (!currentRole.Equals(loginType, StringComparison.OrdinalIgnoreCase))
-                    {
-                        mergedRole = "Both";
-                    }
-
-                    if (!string.Equals(mergedRole, currentRole, StringComparison.OrdinalIgnoreCase))
-                    {
-                        using var cmdUpdateRole = new SqlCommand(
-                            "UPDATE AppUser SET Role = @Role WHERE UserId = @UserId",
-                            con);
-                        cmdUpdateRole.Parameters.AddWithValue("@Role", mergedRole);
-                        cmdUpdateRole.Parameters.AddWithValue("@UserId", userId);
-                        await cmdUpdateRole.ExecuteNonQueryAsync();
-                    }
+                    cmdUpdate.Parameters.AddWithValue("@UserId", userId);
+                    await cmdUpdate.ExecuteNonQueryAsync();
                 }
 
-                // 6) Update last login
-                using (var cmdUpdateLogin = new SqlCommand(
-                    "UPDATE AppUser SET LastLoginUtc = SYSUTCDATETIME() WHERE UserId = @UserId",
-                    con))
-                {
-                    cmdUpdateLogin.Parameters.AddWithValue("@UserId", userId);
-                    await cmdUpdateLogin.ExecuteNonQueryAsync();
-                }
-
-                // 7) Check if this user owns any ACTIVE business
+                // 6) Check if user has any active business
                 bool hasBusiness;
                 using (var cmdBiz = new SqlCommand(@"
             IF EXISTS (SELECT 1 FROM Business WHERE OwnerUserId = @UserId AND IsActive = 1)
@@ -232,14 +157,13 @@ namespace Queueless.Controllers
                                    Convert.ToInt32(bizResult) == 1);
                 }
 
-                // 8) Build response
+                // 7) Build response
                 response.Success = true;
                 response.Message = "OTP verified.";
                 response.UserId = userId;
                 response.IsNewUser = isNewUser;
                 response.HasBusiness = hasBusiness;
-                response.Role = mergedRole;
-                response.ShowRoleSelection = hasBusiness; // frontend: if true, offer Customer/Business choice
+                response.Role = currentRole ?? "Customer";
 
                 return Ok(response);
             }
@@ -250,6 +174,13 @@ namespace Queueless.Controllers
                 return StatusCode(500, response);
             }
         }
+
+
+        // ============================================================
+        //  POST /api/auth/verify-otp
+        //  Simple: check OTP == "1234", then create/find AppUser
+        // ============================================================
+
 
     }
 }

@@ -1,8 +1,12 @@
-﻿using System.Data;
+﻿using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.SqlClient;
-using Queueless.Models;
-using Queueless.Services; // wherever FcmService lives
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+using Queueless.Services; // FcmService
 
 namespace Queueless.Controllers
 {
@@ -48,6 +52,7 @@ namespace Queueless.Controllers
             public string Area { get; set; } = "";
         }
 
+        // POST: /api/customer/queue/join
         [HttpPost("join")]
         public async Task<ActionResult<JoinQueueResult>> Join([FromBody] JoinQueueRequest dto)
         {
@@ -94,8 +99,8 @@ namespace Queueless.Controllers
                 };
             }
 
-            // 2️⃣ Get FCM token from CustomerUser for this user
-            string? fcmToken = null;
+            // 2️⃣ Get FCM token for THIS customer (from AppUser)
+            string? customerFcmToken = null;
 
             await using (var tokenCmd = new SqlCommand(@"
                 SELECT FcmToken
@@ -108,12 +113,12 @@ namespace Queueless.Controllers
                 var obj = await tokenCmd.ExecuteScalarAsync();
                 if (obj != null && obj != DBNull.Value)
                 {
-                    fcmToken = (string)obj;
+                    customerFcmToken = (string)obj;
                 }
             }
 
-            // 3️⃣ Send "Token created" notification if token exists
-            if (!string.IsNullOrWhiteSpace(fcmToken))
+            // 3️⃣ Send "TOKEN_CREATED" notification to customer (if token exists)
+            if (!string.IsNullOrWhiteSpace(customerFcmToken))
             {
                 var data = new Dictionary<string, string>
                 {
@@ -127,7 +132,7 @@ namespace Queueless.Controllers
                 };
 
                 await _fcm.SendAsync(
-                    fcmToken,
+                    customerFcmToken,
                     $"Token created at {result.BusinessName}",
                     $"Your token number is {result.TokenNumber}.",
                     data
@@ -140,11 +145,104 @@ namespace Queueless.Controllers
             else
             {
                 _logger.LogWarning(
-                    "No FcmToken found for CustomerUserId {UserId}, skipping push notification.",
+                    "No FcmToken found for CustomerUserId {UserId}, skipping customer push notification.",
                     dto.CustomerUserId);
             }
 
-            // 4️⃣ Return token info back to Flutter (for UI)
+            // 4️⃣ Notify BUSINESS owner about new / existing token in queue
+            try
+            {
+                // 4a) Find owner of this business
+                int? ownerUserId = null;
+                await using (var ownerCmd = new SqlCommand(@"
+                    SELECT TOP 1 OwnerUserId
+                    FROM   BusinessRegistration
+                    WHERE  BusinessId = @BusinessId
+                      AND  IsActive = 1;", con))
+                {
+                    ownerCmd.Parameters.AddWithValue("@BusinessId", dto.BusinessId);
+                    var ownerObj = await ownerCmd.ExecuteScalarAsync();
+                    if (ownerObj != null && ownerObj != DBNull.Value)
+                    {
+                        ownerUserId = Convert.ToInt32(ownerObj);
+                    }
+                }
+
+                if (ownerUserId.HasValue)
+                {
+                    // 4b) Get all FCM tokens for that owner (in case multiple devices later)
+                    var businessTokens = new List<string>();
+
+                    await using (var bizTokenCmd = new SqlCommand(@"
+                        SELECT FcmToken
+                        FROM   AppUser
+                        WHERE  UserId = @OwnerUserId
+                          AND  FcmToken IS NOT NULL;", con))
+                    {
+                        bizTokenCmd.Parameters.AddWithValue("@OwnerUserId", ownerUserId.Value);
+
+                        await using var r = await bizTokenCmd.ExecuteReaderAsync();
+                        while (await r.ReadAsync())
+                        {
+                            if (!r.IsDBNull(0))
+                            {
+                                var token = r.GetString(0);
+                                if (!string.IsNullOrWhiteSpace(token))
+                                    businessTokens.Add(token);
+                            }
+                        }
+                    }
+
+                    // 4c) Get customer name (for nicer message)
+                    string? customerName = null;
+                    await using (var custNameCmd = new SqlCommand(@"
+                        SELECT FullName
+                        FROM   AppUser
+                        WHERE  UserId = @UserId;", con))
+                    {
+                        custNameCmd.Parameters.AddWithValue("@UserId", dto.CustomerUserId);
+                        var nameObj = await custNameCmd.ExecuteScalarAsync();
+                        if (nameObj != null && nameObj != DBNull.Value)
+                        {
+                            customerName = (string)nameObj;
+                        }
+                    }
+
+                    if (businessTokens.Count > 0)
+                    {
+                        await _fcm.SendQueueUpdateToBusinessAsync(
+                            result.BusinessId,
+                            result.TokenNumber.ToString(),
+                            customerName,
+                            businessTokens);
+
+                        _logger.LogInformation(
+                            "Sent queue_update notification for BusinessId {BusinessId}, Token {TokenNumber}",
+                            result.BusinessId, result.TokenNumber);
+                    }
+                    else
+                    {
+                        _logger.LogWarning(
+                            "No FCM tokens found for business owner {OwnerUserId} (BusinessId {BusinessId}).",
+                            ownerUserId.Value, result.BusinessId);
+                    }
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "No active BusinessRegistration found for BusinessId {BusinessId} when sending queue_update.",
+                        result.BusinessId);
+                }
+            }
+            catch (Exception ex)
+            {
+                // Don’t fail the API if push fails – just log
+                _logger.LogError(ex,
+                    "Error while sending queue_update notification for BusinessId {BusinessId}, TokenId {TokenId}",
+                    result.BusinessId, result.TokenId);
+            }
+
+            // 5️⃣ Return token info back to Flutter (for UI)
             return Ok(result);
         }
     }

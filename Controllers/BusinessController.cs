@@ -106,6 +106,7 @@ namespace Queueless.Controllers
             string category;
             string area;
             int? avgServiceTime = null;
+            bool isOpen = true;  // 👈 NEW
 
             using (var cmdBiz = new SqlCommand(@"
                 SELECT TOP 1 
@@ -113,7 +114,8 @@ namespace Queueless.Controllers
                     BusinessName, 
                     Category, 
                     Area, 
-                    AvgTimeMinutes
+                    AvgTimeMinutes,
+                    IsOpen  
                 FROM BusinessRegistration
                 WHERE OwnerUserId = @OwnerUserId AND IsActive = 1
                 ORDER BY CreatedOn DESC;", con))
@@ -131,6 +133,7 @@ namespace Queueless.Controllers
                 category = r.IsDBNull(2) ? "" : r.GetString(2);
                 area = r.IsDBNull(3) ? "" : r.GetString(3);
                 if (!r.IsDBNull(4)) avgServiceTime = r.GetInt32(4);
+                if (!r.IsDBNull(5)) isOpen = r.GetBoolean(5);
             }
 
             // 2) Current token (today)
@@ -192,10 +195,162 @@ namespace Queueless.Controllers
                 AvgWaitMinutes = avgServiceTime,
                 CurrentTokenNumber = currentTokenNumber,
                 WaitingCount = queueItems.Count,
-                Queue = queueItems
+                Queue = queueItems,
+                IsOpen = isOpen
             };
 
             return Ok(dto);
         }
+        public class SetOpenRequest
+        {
+            public int OwnerUserId { get; set; }
+            public bool IsOpen { get; set; }
+        }
+
+        // POST: api/business/set-open
+        [HttpPost("set-open")]
+        public async Task<IActionResult> SetOpen([FromBody] SetOpenRequest dto)
+        {
+            if (dto.OwnerUserId <= 0)
+                return BadRequest("OwnerUserId is required.");
+
+            using var con = new SqlConnection(_connectionString);
+            await con.OpenAsync();
+
+            using var cmd = new SqlCommand(@"
+                UPDATE BusinessRegistration
+                SET IsOpen = @IsOpen
+                WHERE OwnerUserId = @OwnerUserId AND IsActive = 1;", con);
+
+            cmd.Parameters.AddWithValue("@IsOpen", dto.IsOpen);
+            cmd.Parameters.AddWithValue("@OwnerUserId", dto.OwnerUserId);
+
+            var rows = await cmd.ExecuteNonQueryAsync();
+            if (rows == 0)
+                return NotFound("Business not found for this owner.");
+
+            return Ok(new
+            {
+                success = true,
+                isOpen = dto.IsOpen
+            });
+        }
+
+        public class NextTokenRequest
+        {
+            public int OwnerUserId { get; set; }
+        }
+
+        // POST: api/business/next-token
+        [HttpPost("next-token")]
+        public async Task<IActionResult> StartNextToken(
+            [FromBody] NextTokenRequest dto)
+        {
+            if (dto.OwnerUserId <= 0)
+                return BadRequest("OwnerUserId is required.");
+
+            using var con = new SqlConnection(_connectionString);
+            await con.OpenAsync();
+
+            // 1) Find businessId
+            int businessId;
+
+            using (var cmdBiz = new SqlCommand(@"
+                SELECT TOP 1 BusinessId
+                FROM BusinessRegistration
+                WHERE OwnerUserId = @OwnerUserId AND IsActive = 1
+                ORDER BY CreatedOn DESC;", con))
+            {
+                cmdBiz.Parameters.AddWithValue("@OwnerUserId", dto.OwnerUserId);
+                var obj = await cmdBiz.ExecuteScalarAsync();
+                if (obj == null || obj == DBNull.Value)
+                    return NotFound("No active business for this owner.");
+
+                businessId = Convert.ToInt32(obj);
+            }
+
+            var today = DateTime.UtcNow.Date;
+
+            // 2) Finish current token if any (Serving / At counter)
+            int? currentTokenId = null;
+
+            using (var cmdCurr = new SqlCommand(@"
+                SELECT TOP 1 TokenId
+                FROM ServiceQueueToken
+                WHERE BusinessId = @BusinessId
+                  AND CAST(CreatedOn AS DATE) = @Today
+                  AND Status IN (N'Serving', N'At counter')
+                ORDER BY CreatedOn DESC;", con))
+            {
+                cmdCurr.Parameters.AddWithValue("@BusinessId", businessId);
+                cmdCurr.Parameters.AddWithValue("@Today", today);
+
+                var obj = await cmdCurr.ExecuteScalarAsync();
+                if (obj != null && obj != DBNull.Value)
+                    currentTokenId = Convert.ToInt32(obj);
+            }
+
+            if (currentTokenId.HasValue)
+            {
+                using var cmdFinish = new SqlCommand(@"
+                    UPDATE ServiceQueueToken
+                    SET Status = N'Completed'
+                    WHERE TokenId = @TokenId;", con);
+                cmdFinish.Parameters.AddWithValue("@TokenId", currentTokenId.Value);
+                await cmdFinish.ExecuteNonQueryAsync();
+            }
+
+            // 3) Pick next waiting token (this handles "first token" also)
+            int? nextTokenId = null;
+            int? nextTokenNumber = null;
+
+            using (var cmdNext = new SqlCommand(@"
+                SELECT TOP 1 TokenId, TokenNumber
+                FROM ServiceQueueToken
+                WHERE BusinessId = @BusinessId
+                  AND CAST(CreatedOn AS DATE) = @Today
+                  AND Status = N'Waiting'
+                ORDER BY CreatedOn ASC;", con))
+            {
+                cmdNext.Parameters.AddWithValue("@BusinessId", businessId);
+                cmdNext.Parameters.AddWithValue("@Today", today);
+
+                using var r = await cmdNext.ExecuteReaderAsync();
+                if (await r.ReadAsync())
+                {
+                    nextTokenId = r.GetInt32(0);
+                    nextTokenNumber = r.GetInt32(1);
+                }
+            }
+
+            if (nextTokenId.HasValue)
+            {
+                using var cmdStart = new SqlCommand(@"
+                    UPDATE ServiceQueueToken
+                    SET Status = N'Serving'
+                    WHERE TokenId = @TokenId;", con);
+                cmdStart.Parameters.AddWithValue("@TokenId", nextTokenId.Value);
+                await cmdStart.ExecuteNonQueryAsync();
+
+                return Ok(new
+                {
+                    success = true,
+                    message = $"Token {nextTokenNumber} started.",
+                    tokenId = nextTokenId,
+                    tokenNumber = nextTokenNumber
+                });
+            }
+
+            // No more waiting
+            return Ok(new
+            {
+                success = true,
+                message = "No more tokens in queue.",
+                tokenId = (int?)null,
+                tokenNumber = (int?)null
+            });
+        }
+
+
     }
 }

@@ -25,7 +25,7 @@ namespace Queueless.Services
             if (_initialized)
                 return;
 
-            // 1) Try to read full JSON from env var (cloud-friendly, no file needed)
+            // 1) Try to read full JSON from env var (Render / cloud)
             var jsonFromEnv = Environment.GetEnvironmentVariable("FIREBASE_ADMIN_JSON");
             if (!string.IsNullOrWhiteSpace(jsonFromEnv))
             {
@@ -43,7 +43,7 @@ namespace Queueless.Services
                 return;
             }
 
-            // 2) Fallback: read from file (for your local dev machine)
+            // 2) Fallback: local file for your dev machine
             // appsettings.json:
             // "Firebase": { "AdminSdkPath": "Secure/firebase-admin-key.json" }
             var keyPath = configuration["Firebase:AdminSdkPath"];
@@ -73,9 +73,9 @@ namespace Queueless.Services
             _logger.LogInformation("FirebaseApp initialized from file {Path}.", keyPath);
         }
 
-        // --------------------------------------------------------------------
-        // 1) Single-token send (generic)  — your existing method
-        // --------------------------------------------------------------------
+        /// <summary>
+        /// Send a push notification to a single device.
+        /// </summary>
         public async Task SendAsync(
             string fcmToken,
             string title,
@@ -113,106 +113,37 @@ namespace Queueless.Services
             }
         }
 
-        // --------------------------------------------------------------------
-        // 2) Multi-token send (generic) — useful for owner with many devices
-        // --------------------------------------------------------------------
+        /// <summary>
+        /// Send the same notification to many devices.
+        /// Implementation: simply loop and call SendAsync for each token.
+        /// This avoids the Firebase /batch endpoint that is returning 404.
+        /// </summary>
         public async Task SendToManyAsync(
             IEnumerable<string> tokens,
             string title,
             string body,
             IReadOnlyDictionary<string, string>? data = null)
         {
-            var tokenList = tokens
+            var list = tokens
                 .Where(t => !string.IsNullOrWhiteSpace(t))
-                .Distinct()
+                .Select(t => t.Trim())
+                .Distinct(StringComparer.Ordinal)
                 .ToList();
 
-            if (!tokenList.Any())
+            if (list.Count == 0)
             {
-                _logger.LogInformation("SendToManyAsync called with no valid tokens.");
+                _logger.LogWarning("SendToManyAsync called with no tokens.");
                 return;
             }
 
-            IReadOnlyDictionary<string, string> payload =
-                data ?? new Dictionary<string, string>();
+            _logger.LogInformation(
+                "Sending FCM notification to {Count} tokens (looped, no multicast).",
+                list.Count);
 
-            var message = new MulticastMessage
+            foreach (var token in list)
             {
-                Tokens = tokenList,
-                Notification = new Notification
-                {
-                    Title = title,
-                    Body = body
-                },
-                Data = payload
-            };
-
-            try
-            {
-                var response = await FirebaseMessaging
-                    .DefaultInstance
-                    .SendMulticastAsync(message);
-
-                _logger.LogInformation(
-                    "FCM multicast sent. Success={SuccessCount}, Failure={FailureCount}",
-                    response.SuccessCount,
-                    response.FailureCount);
-
-                if (response.FailureCount > 0)
-                {
-                    for (int i = 0; i < response.Responses.Count; i++)
-                    {
-                        var r = response.Responses[i];
-                        if (!r.IsSuccess)
-                        {
-                            _logger.LogWarning(
-                                "FCM error for token {Token}: {Error}",
-                                tokenList[i],
-                                r.Exception?.Message);
-                        }
-                    }
-                }
+                await SendAsync(token, title, body, data);
             }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error sending FCM multicast notification.");
-            }
-        }
-
-        // --------------------------------------------------------------------
-        // 3) Business queue update — called when a new token joins the queue
-        // --------------------------------------------------------------------
-        public Task SendQueueUpdateToBusinessAsync(
-            int businessId,
-            string? tokenNumber,
-            string? customerName,
-            IEnumerable<string> deviceTokens)
-        {
-            string title = "New customer in queue";
-
-            string body;
-            if (string.IsNullOrWhiteSpace(customerName))
-            {
-                body = string.IsNullOrWhiteSpace(tokenNumber)
-                    ? "A new customer joined your queue."
-                    : $"New token {tokenNumber} joined your queue.";
-            }
-            else
-            {
-                body = string.IsNullOrWhiteSpace(tokenNumber)
-                    ? $"{customerName} joined your queue."
-                    : $"{customerName} joined with token {tokenNumber}.";
-            }
-
-            var data = new Dictionary<string, string>
-            {
-                ["type"] = "queue_update",
-                ["businessId"] = businessId.ToString(),
-                ["tokenNumber"] = tokenNumber ?? string.Empty,
-                ["customerName"] = customerName ?? string.Empty
-            };
-
-            return SendToManyAsync(deviceTokens, title, body, data);
         }
     }
 }

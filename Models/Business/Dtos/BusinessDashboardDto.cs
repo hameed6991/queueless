@@ -18,6 +18,8 @@ namespace Queueless.Models.Business.Dtos
         // how many are currently waiting
         public int WaitingCount { get; set; }
 
+        public bool IsOpen { get; set; }
+
         // list of tokens in the waiting queue
         public List<BusinessQueueItemDto> Queue { get; set; } = new();
     }
